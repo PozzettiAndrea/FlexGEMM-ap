@@ -1,9 +1,44 @@
 from typing import *
 import torch
 from torch.autograd import Function
+from tqdm import tqdm
 from . import Algorithm
 from .. import spconv, utils
 from ... import kernels
+
+
+def _partition_octree(spatial_coords, max_voxels, depth=0):
+    """
+    Recursively split spatial extent along longest axis until each
+    partition has <= max_voxels. Returns list of (tile_min, tile_max) tensors.
+    tile_min is inclusive, tile_max is exclusive.
+    """
+    N = spatial_coords.shape[0]
+    if N <= max_voxels:
+        tile_min = spatial_coords.min(0)[0]
+        tile_max = spatial_coords.max(0)[0] + 1
+        return [(tile_min, tile_max)]
+
+    mins = spatial_coords.min(0)[0]
+    maxs = spatial_coords.max(0)[0]
+    extents = maxs - mins
+    axis = extents.argmax().item()
+
+    if extents[axis] < 2:
+        return [(mins, maxs + 1)]
+
+    mid = (mins[axis].item() + maxs[axis].item()) // 2 + 1
+    left_mask = spatial_coords[:, axis] < mid
+    right_mask = ~left_mask
+    left_count = left_mask.sum().item()
+    right_count = right_mask.sum().item()
+
+    tiles = []
+    if left_count > 0:
+        tiles.extend(_partition_octree(spatial_coords[left_mask], max_voxels, depth + 1))
+    if right_count > 0:
+        tiles.extend(_partition_octree(spatial_coords[right_mask], max_voxels, depth + 1))
+    return tiles
 
 
 class SubMConv3dNeighborCache:
@@ -34,6 +69,122 @@ class SubMConv3dNeighborCache:
 
 
 class SubMConv3dFunction(Function):
+    @staticmethod
+    def tiled_forward(feats, coords, shape, weight, bias, kernel_size, dilation,
+                      max_voxels_per_tile=1_000_000):
+        """
+        Spatially-tiled submanifold conv. Splits voxels into tiles with halo
+        overlap, runs conv per tile, merges interior results.
+        Mathematically identical to full conv — submanifold conv is local.
+
+        VRAM strategy: input feats and output are kept on CPU during tiling.
+        Only the per-tile subset (feats, cache, conv output) lives on GPU
+        transiently. The final output is copied to GPU at the end.
+
+        Accepts feats on CPU or GPU. Uses weight.device as compute device.
+        """
+        N = feats.shape[0]
+        Co = weight.shape[0]
+        Ci = weight.shape[-1]
+        device = weight.device  # always GPU — feats may be on CPU
+
+        _ma = torch.cuda.memory_allocated
+        feats_mb = feats.numel() * feats.element_size() / 1024**2
+        out_mb = N * Co * feats.element_size() / 1024**2
+        print(f"[tiled_conv] N={N:,} Ci={Ci} Co={Co} K={kernel_size} "
+              f"feats={feats_mb:.0f}MB out={out_mb:.0f}MB "
+              f"feats_dev={feats.device} alloc={_ma()//1048576}MB", flush=True)
+
+        if N <= max_voxels_per_tile:
+            feats_gpu = feats.to(device) if not feats.is_cuda else feats
+            cache = SubMConv3dFunction._compute_neighbor_cache(
+                coords, shape, kernel_size, dilation)
+            out = SubMConv3dFunction._sparse_submanifold_conv_forward(
+                feats_gpu, cache, weight, bias)
+            del cache, feats_gpu
+            return out
+
+        # Halo radius = max kernel radius * dilation per axis
+        halo = max((k // 2) * d for k, d in zip(kernel_size, dilation))
+        spatial = coords[:, 1:]  # [N, 3] — drop batch dim
+
+        # Partition into tiles (suppress per-leaf prints)
+        tiles = _partition_octree(spatial, max_voxels_per_tile)
+
+        # Ensure feats are on CPU for tiling
+        if feats.is_cuda:
+            feats_cpu = feats.cpu()
+            del feats
+            torch.cuda.empty_cache()
+        else:
+            feats_cpu = feats
+
+        vram_before = _ma() // 1048576
+        print(f"[tiled_conv] {len(tiles)} tiles, VRAM baseline={vram_before}MB", flush=True)
+
+        # Accumulate output on CPU — avoids large GPU allocation during tiling
+        out_cpu = torch.empty((N, Co), device='cpu', dtype=feats_cpu.dtype)
+        total_interior = 0
+        peak_tile_vram = 0
+
+        pbar = tqdm(tiles, desc="Tiled Conv3d", unit="tile",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+        for i, (tile_min, tile_max) in enumerate(pbar):
+            # Interior: voxels strictly within tile bounds
+            interior_mask = ((spatial >= tile_min) & (spatial < tile_max)).all(dim=1)
+
+            # Halo: voxels within halo distance of tile boundary
+            halo_min = tile_min - halo
+            halo_max = tile_max + halo
+            halo_mask = ((spatial >= halo_min) & (spatial < halo_max)).all(dim=1)
+
+            # Extract tile tensors — feats from CPU, coords already on GPU
+            tile_indices = halo_mask.nonzero(as_tuple=True)[0]
+            tile_indices_cpu = tile_indices.cpu()
+            tile_feats = feats_cpu[tile_indices_cpu].to(device)
+            tile_coords = coords[tile_indices].contiguous()
+            interior_count = interior_mask.sum().item()
+            total_interior += interior_count
+
+            # Compute neighbor cache for this tile only
+            tile_cache = SubMConv3dFunction._compute_neighbor_cache(
+                tile_coords, shape, kernel_size, dilation)
+
+            # Run conv on tile
+            tile_out = SubMConv3dFunction._sparse_submanifold_conv_forward(
+                tile_feats, tile_cache, weight, bias)
+
+            torch.cuda.synchronize()
+            tile_vram = _ma() // 1048576
+            peak_tile_vram = max(peak_tile_vram, tile_vram)
+
+            # Map interior voxels back — scatter to CPU output
+            interior_in_tile = interior_mask[tile_indices]
+            interior_global_cpu = tile_indices_cpu[interior_in_tile.cpu()]
+            out_cpu[interior_global_cpu] = tile_out[interior_in_tile].cpu()
+
+            del tile_feats, tile_coords, tile_cache, tile_out, tile_indices, tile_indices_cpu
+            del interior_mask, halo_mask, interior_in_tile, interior_global_cpu
+            torch.cuda.empty_cache()
+
+            pbar.set_postfix_str(f"vram={_ma()//1048576}MB peak={peak_tile_vram}MB")
+
+        pbar.close()
+        del feats_cpu
+
+        # Move final output to GPU
+        out = out_cpu.to(device)
+        del out_cpu
+
+        vram_final = _ma() // 1048576
+        print(f"[tiled_conv] done: {total_interior}/{N} voxels, "
+              f"tile_peak={peak_tile_vram}MB, final={vram_final}MB", flush=True)
+
+        if total_interior != N:
+            print(f"[tiled_conv] WARNING: missing {N - total_interior} voxels!", flush=True)
+
+        return out
+
     @staticmethod
     def _compute_neighbor_cache(
         coords: torch.Tensor,
