@@ -339,7 +339,7 @@ def get_autotune_cache():
             elif isinstance(attr, TritonPersistentCacheAutotuner):
                 cache[device_name][cache_key] = {k: v.__dict__ for k, v in attr.cache.items()}
 
-    walk_package('flex_gemm', save_cache)
+    walk_package('flex_gemm_ap', save_cache)
 
     return cache
 
@@ -406,4 +406,4 @@ def load_autotune_cache(path_or_cache=None):
                         attr.cache[k] = triton.runtime.Config(None)
                         attr.cache[k].__dict__.update(v)
 
-    walk_package('flex_gemm', load_cache)
+    walk_package('flex_gemm_ap', load_cache)

@@ -39,32 +39,32 @@ else:
     }
 
 setup(
-    name="flex_gemm",
+    name="flex_gemm_ap",
     packages=[
-        "flex_gemm",
-        "flex_gemm.utils",
-        "flex_gemm.ops",
-        "flex_gemm.ops.spconv",
-        "flex_gemm.ops.grid_sample",
-        "flex_gemm.kernels",
-        "flex_gemm.kernels.triton",
-        "flex_gemm.kernels.triton.spconv",
-        "flex_gemm.kernels.triton.grid_sample",
+        "flex_gemm_ap",
+        "flex_gemm_ap.utils",
+        "flex_gemm_ap.ops",
+        "flex_gemm_ap.ops.spconv",
+        "flex_gemm_ap.ops.grid_sample",
+        "flex_gemm_ap.kernels",
+        "flex_gemm_ap.kernels.triton",
+        "flex_gemm_ap.kernels.triton.spconv",
+        "flex_gemm_ap.kernels.triton.grid_sample",
     ],
     ext_modules=[
         CUDAExtension(
-            name="flex_gemm.kernels.cuda",
+            name="flex_gemm_ap.kernels.cuda",
             sources=[
                 # Hashmap functions
-                "flex_gemm/kernels/cuda/hash/hash.cu",
+                "flex_gemm_ap/kernels/cuda/hash/hash.cu",
                 # Serialization functions
-                "flex_gemm/kernels/cuda/serialize/api.cu",
+                "flex_gemm_ap/kernels/cuda/serialize/api.cu",
                 # Grid sample functions
-                "flex_gemm/kernels/cuda/grid_sample/grid_sample.cu",
+                "flex_gemm_ap/kernels/cuda/grid_sample/grid_sample.cu",
                 # Convolution functions
-                "flex_gemm/kernels/cuda/spconv/neighbor_map.cu",
+                "flex_gemm_ap/kernels/cuda/spconv/neighbor_map.cu",
                 # main
-                "flex_gemm/kernels/cuda/ext.cpp",
+                "flex_gemm_ap/kernels/cuda/ext.cpp",
             ],
             extra_compile_args=extra_compile_args
         )
