@@ -41,7 +41,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_kernel(
     
     # Create pointers for submatrices of A and B.
     num_k = tl.cdiv(Co, BK)  # Number of blocks in K dimension
-    offset_n = (block_id_n * B1 + tl.arange(0, B1)) % N         # (B1,)
+    offset_n = (block_id_n.to(tl.int64) * B1 + tl.arange(0, B1)) % N         # (B1,)
     offset_ci = (block_id_ci * B2 + tl.arange(0, B2)) % Ci      # (B2,)
     offset_k = tl.arange(0, BK)                                 # (BK,)
     
@@ -53,7 +53,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_kernel(
         v = k // num_k
         bk = k % num_k
         # Calculate pointers to grad_output matrix.
-        neighbor_offset_n = tl.load(neighbor + offset_n * V + V - 1 - v)                                    # (B1,)
+        neighbor_offset_n = tl.load(neighbor + offset_n.to(tl.int64) * V + V - 1 - v)                                    # (B1,)
         grad_output_ptr = grad_output + bk * BK + (neighbor_offset_n[:, None].to(tl.int64) * Co + offset_k[None, :])     # (B1, BK)
         # Calculate pointers to weight matrix.
         weight_ptr = weight + (((offset_k[:, None] + bk * BK) * V + v) * Ci + offset_ci[None, :])           # (BK, B2)
@@ -68,9 +68,9 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_kernel(
     c = accumulator.to(grad_output.type.element_ty)
                 
     # Write back the block of the output matrix with masks.
-    grad_input_offset_n = block_id_n * B1 + tl.arange(0, B1)
+    grad_input_offset_n = block_id_n.to(tl.int64) * B1 + tl.arange(0, B1)
     grad_input_offset_ci = block_id_ci * B2 + tl.arange(0, B2)
-    grad_input_ptr = grad_input + (grad_input_offset_n[:, None] * Ci + grad_input_offset_ci[None, :])
+    grad_input_ptr = grad_input + (grad_input_offset_n[:, None].to(tl.int64) * Ci + grad_input_offset_ci[None, :])
     grad_input_mask = (grad_input_offset_n[:, None] < N) & (grad_input_offset_ci[None, :] < Ci)
     tl.store(grad_input_ptr, c, mask=grad_input_mask)
 
@@ -120,8 +120,8 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_kernel(
     offset_v = (tl.arange(0, BV) + (block_id_vci // (Ci // BCi)) * BV) % V          # (BV,)
     offset_ci = (tl.arange(0, BCi) + (block_id_vci % (Ci // BCi)) * BCi) % Ci       # (BCi,)
     offset_k = tl.arange(0, BK)                                                     # (BK,)
-    neighbor_ptr = neighbor + (offset_k[:, None] * V + offset_v[None, :])           # (BK, BV)
-    grad_output_ptr = grad_output + (offset_k[None, :] * Co + offset_co[:, None])   # (B1, BK)
+    neighbor_ptr = neighbor + (offset_k[:, None].to(tl.int64) * V + offset_v[None, :])           # (BK, BV)
+    grad_output_ptr = grad_output + (offset_k[None, :].to(tl.int64) * Co + offset_co[:, None])   # (B1, BK)
     
     # Create a block of the output matrix C.
     accumulator = tl.zeros((B1, BV * BCi), dtype=tl.float32)   
